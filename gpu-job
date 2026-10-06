@@ -43,7 +43,13 @@ import json,sys,os
 o=[x for x in json.load(sys.stdin) if x['dph_total']<=float('$MAXDPH') and int(str(x.get('driver_version') or '0').split('.')[0])>=535]
 print(o[0]['id'] if o else '')")
 [ -n "$OFFER" ] || { echo "no offer under $MAXDPH USD/h for: $QUERY" >&2; exit 69; }
-IID=$($V create instance "$OFFER" --image ghcr.io/vaurdan/godot-gpu-runner:4.7.2 --disk 20 --ssh --direct \
+# pin the image by digest so hosts never run a stale cached :4.7.2
+TOK=$(curl -fsS "https://ghcr.io/token?scope=repository:vaurdan/godot-gpu-runner:pull" | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")
+DIGEST=$(curl -fsSI -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+  https://ghcr.io/v2/vaurdan/godot-gpu-runner/manifests/${GPU_IMAGE_TAG:-4.7.2} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+[ -n "$DIGEST" ] || { echo "cannot resolve image digest" >&2; exit 69; }
+echo "image ghcr.io/vaurdan/godot-gpu-runner@$DIGEST"
+IID=$($V create instance "$OFFER" --image "ghcr.io/vaurdan/godot-gpu-runner@$DIGEST" --disk 20 --ssh --direct \
       --env '-e NVIDIA_DRIVER_CAPABILITIES=all' --label "gpu-job-$RUN_ID" --raw | python3 -c "import json,sys;print(json.load(sys.stdin)['new_contract'])")
 echo "instance $IID (offer $OFFER)"
 ( sleep "$TTL"; $V destroy instance "$IID" -y ) >/dev/null 2>&1 &
@@ -74,6 +80,7 @@ s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.e
 s3.download_file(os.environ['B2_BUCKET'], f'runs/{sys.argv[1]}/result.tgz', sys.argv[2])
 EOF
 tar -xzf "$OUT/result.tgz" -C "$OUT"
+[ -f "$OUT/gpu-diag.txt" ] && { echo '--- gpu-diag (no NVIDIA Vulkan) ---'; head -40 "$OUT/gpu-diag.txt"; }
 echo "gpu: $(tr '\n' ' ' < "$OUT/gpu.txt")"; echo "godot exit: $(cat "$OUT/exit_code")"
 grep -m1 'Using Device' "$OUT/run.log" || true
 echo "artifacts: $OUT  (B2 runs/$RUN_ID, expires ~30 d)"
