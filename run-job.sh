@@ -15,10 +15,11 @@ echo "$CODE_SHA  $W/code.tar" | sha256sum -c - >/dev/null
 tar -xf "$W/code.tar" -C "$W/src"
 
 cd "$W/src"
-# Movie Maker records at the project viewport size and ignores --resolution; mirror it into override.cfg.
+# Movie Maker records at the window size and ignores --resolution; set the window override only
+# (viewport/stretch base untouched, so pixel-art/UI scaling is preserved).
 RES=$(printf '%s\n' "$@" | grep -A1 -x -- --resolution | tail -1 | grep -xE '[0-9]+x[0-9]+' || true)
 if [ -n "$RES" ]; then
-  printf '\n[display]\nwindow/size/viewport_width=%s\nwindow/size/viewport_height=%s\n' "${RES%x*}" "${RES#*x}" >> override.cfg
+  printf '\n[display]\nwindow/size/window_width_override=%s\nwindow/size/window_height_override=%s\n' "${RES%x*}" "${RES#*x}" >> override.cfg
 fi
 timeout 600 godot --headless --path . --import > "$W/out/import.log" 2>&1 || true
 set +e

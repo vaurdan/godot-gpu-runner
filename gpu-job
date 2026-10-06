@@ -1,0 +1,78 @@
+#!/bin/bash
+# gpu-job: run one Godot job on a disposable Vast.ai GPU and fetch the result.
+# Usage: gpu-job <repo_dir> <full_commit_sha> <project_subdir|.> <out_dir> -- <godot args...>
+# Example: gpu-job /root/workspace/night-shift 3f2a...40hex game /root/runs/x -- \
+#            --resolution 1920x1080 --fixed-fps 30 --write-movie /job/out/run.avi --quit-after 300
+# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.15), GPU_TTL (safety-net seconds, default 2700)
+set -euo pipefail
+REPO=$1; SHA=$2; SUB=$3; OUT=$4; shift 4; [ "${1:-}" = "--" ] && shift
+[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full 40-char commit SHA, not a branch" >&2; exit 64; }
+V=/root/.venvs/vast/bin/vastai; KEY=/root/.ssh/vast_ed25519
+set -a; . /root/.config/b2/godot-gpu-queue.env; set +a
+QUERY=${GPU_QUERY:-"gpu_name=RTX_3060 num_gpus=1 reliability>0.98 rentable=true inet_down>500 disk_space>=20"}
+MAXDPH=${GPU_MAX_DPH:-0.15}; TTL=${GPU_TTL:-2700}
+RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-${SHA:0:12}-$$
+mkdir -p "$OUT"; LOG="$OUT/gpu-job.log"; exec > >(tee -a "$LOG") 2>&1
+echo "run $RUN_ID repo=$REPO sha=$SHA sub=$SUB args=$*"
+
+# 1. pack exact revision (cached per tree in B2)
+TREE=$(git -C "$REPO" rev-parse "$SHA:${SUB#./}" 2>/dev/null || git -C "$REPO" rev-parse "$SHA^{tree}")
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+git -C "$REPO" archive --format=tar "$TREE" | gzip -n -1 > "$TMP/code.tar.gz"
+CSHA=$(sha256sum "$TMP/code.tar.gz" | cut -d' ' -f1)
+read -r GET PUT < <(python3 - "$TMP/code.tar.gz" "$CSHA" "$RUN_ID" <<'EOF'
+import os, sys, boto3
+from botocore.exceptions import ClientError
+s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
+                  aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
+B, f, h, rid = os.environ['B2_BUCKET'], sys.argv[1], sys.argv[2], sys.argv[3]
+k = f'code/{h}.tar.gz'
+try: s3.head_object(Bucket=B, Key=k)
+except ClientError: s3.upload_file(f, B, k)
+g = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': k}, ExpiresIn=7200)
+p = s3.generate_presigned_url('put_object', Params={'Bucket': B, 'Key': f'runs/{rid}/result.tgz'}, ExpiresIn=7200)
+print(g, p)
+EOF
+)
+echo "code archive sha256=$CSHA"
+
+# 2. rent, with safety net
+OFFER=$($V search offers "$QUERY" -o dph_total --raw | python3 -c "
+import json,sys,os
+o=[x for x in json.load(sys.stdin) if x['dph_total']<=float('$MAXDPH') and int(str(x.get('driver_version') or '0').split('.')[0])>=535]
+print(o[0]['id'] if o else '')")
+[ -n "$OFFER" ] || { echo "no offer under $MAXDPH USD/h for: $QUERY" >&2; exit 69; }
+IID=$($V create instance "$OFFER" --image ghcr.io/vaurdan/godot-gpu-runner:4.7.2 --disk 20 --ssh --direct \
+      --env '-e NVIDIA_DRIVER_CAPABILITIES=all' --label "gpu-job-$RUN_ID" --raw | python3 -c "import json,sys;print(json.load(sys.stdin)['new_contract'])")
+echo "instance $IID (offer $OFFER)"
+( sleep "$TTL"; $V destroy instance "$IID" -y ) >/dev/null 2>&1 &
+NET=$!
+cleanup() { $V destroy instance "$IID" -y >/dev/null 2>&1 || true; kill "$NET" 2>/dev/null || true; rm -rf "$TMP"; echo "instance $IID destroyed"; }
+trap cleanup EXIT
+
+# 3. wait for SSH
+for i in $(seq 1 60); do
+  read -r ST IP PORT < <($V show instance "$IID" --raw | python3 -c "
+import json,sys;d=json.load(sys.stdin);p=((d.get('ports') or {}).get('22/tcp') or [{}])[0].get('HostPort');print(d.get('actual_status'),d.get('public_ipaddr'),p)")
+  [ "$ST" = running ] && [ "$PORT" != None ] && break; sleep 10
+done
+[ "$ST" = running ] || { echo "instance never reached running" >&2; exit 75; }
+SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o LogLevel=ERROR -p $PORT root@$IP"
+for i in $(seq 1 12); do $SSH true 2>/dev/null && break; sleep 5; done
+
+# 4. run (args are quoted for the remote shell)
+ARGS=$(printf '%q ' "$@")
+set +e; $SSH "rm -f /root/.vast_api_key; run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
+echo "remote rc=$RC"
+
+# 5. fetch result
+python3 - "$RUN_ID" "$OUT/result.tgz" <<'EOF'
+import os, sys, boto3
+s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
+                  aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
+s3.download_file(os.environ['B2_BUCKET'], f'runs/{sys.argv[1]}/result.tgz', sys.argv[2])
+EOF
+tar -xzf "$OUT/result.tgz" -C "$OUT"
+echo "gpu: $(tr '\n' ' ' < "$OUT/gpu.txt")"; echo "godot exit: $(cat "$OUT/exit_code")"
+grep -m1 'Using Device' "$OUT/run.log" || true
+echo "artifacts: $OUT  (B2 runs/$RUN_ID, expires ~30 d)"
