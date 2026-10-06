@@ -3,14 +3,17 @@
 # Usage: gpu-job <repo_dir> <full_commit_sha> <project_subdir|.> <out_dir> -- <godot args...>
 # Example: gpu-job /root/workspace/night-shift 3f2a...40hex game /root/runs/x -- \
 #            --resolution 1920x1080 --fixed-fps 30 --write-movie /job/out/run.avi --quit-after 300
-# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.15), GPU_TTL (safety-net seconds, default 2700)
+# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.15), GPU_TTL (safety-net seconds, default 2700),
+#      JOB_TIMEOUT (godot run limit on the host, default 1800; GPU_TTL is raised to fit it)
 set -euo pipefail
 REPO=$1; SHA=$2; SUB=$3; OUT=$4; shift 4; [ "${1:-}" = "--" ] && shift
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full 40-char commit SHA, not a branch" >&2; exit 64; }
 V=/root/.venvs/vast/bin/vastai; KEY=/root/.ssh/vast_ed25519
 set -a; . /root/.config/b2/godot-gpu-queue.env; set +a
 QUERY=${GPU_QUERY:-"gpu_name=RTX_3060 num_gpus=1 reliability>0.98 rentable=true inet_down>500 disk_space>=20"}
-MAXDPH=${GPU_MAX_DPH:-0.15}; TTL=${GPU_TTL:-2700}
+MAXDPH=${GPU_MAX_DPH:-0.15}; JOBT=${JOB_TIMEOUT:-1800}; TTL=${GPU_TTL:-2700}
+[ "$TTL" -lt $((JOBT + 1200)) ] && TTL=$((JOBT + 1200))
+export URL_TTL=$((TTL + 600))
 RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-${SHA:0:12}-$$
 mkdir -p "$OUT"; LOG="$OUT/gpu-job.log"; exec > >(tee -a "$LOG") 2>&1
 echo "run $RUN_ID repo=$REPO sha=$SHA sub=$SUB args=$*"
@@ -30,8 +33,8 @@ B, f, h, rid = os.environ['B2_BUCKET'], sys.argv[1], sys.argv[2], sys.argv[3]
 k = f'code/{h}.tar.gz'
 try: s3.head_object(Bucket=B, Key=k)
 except ClientError: s3.upload_file(f, B, k)
-g = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': k}, ExpiresIn=7200)
-p = s3.generate_presigned_url('put_object', Params={'Bucket': B, 'Key': f'runs/{rid}/result.tgz'}, ExpiresIn=7200)
+g = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': k}, ExpiresIn=int(os.environ['URL_TTL']))
+p = s3.generate_presigned_url('put_object', Params={'Bucket': B, 'Key': f'runs/{rid}/result.tgz'}, ExpiresIn=int(os.environ['URL_TTL']))
 print(g, p)
 EOF
 )
@@ -69,7 +72,7 @@ for i in $(seq 1 12); do $SSH true 2>/dev/null && break; sleep 5; done
 
 # 4. run (args are quoted for the remote shell)
 ARGS=$(printf '%q ' "$@")
-set +e; $SSH "rm -f /root/.vast_api_key; run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
+set +e; $SSH "rm -f /root/.vast_api_key; JOB_TIMEOUT=$JOBT run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
 echo "remote rc=$RC"
 
 # 5. fetch result
