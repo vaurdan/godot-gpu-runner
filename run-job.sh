@@ -10,9 +10,9 @@ pgrep -x Xvfb >/dev/null || { Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 & 
   vulkaninfo --summary 2>/dev/null | grep -m1 deviceName; } > "$W/out/gpu.txt"
 grep -q 'deviceName.*NVIDIA' "$W/out/gpu.txt" || { echo "no NVIDIA Vulkan device" >&2; exit 2; }
 
-curl -fsS -o "$W/code.tar.zst" "$CODE_URL"
-echo "$CODE_SHA  $W/code.tar.zst" | sha256sum -c - >/dev/null
-tar --zstd -xf "$W/code.tar.zst" -C "$W/src"
+curl -fsS -o "$W/code.tar" "$CODE_URL"
+echo "$CODE_SHA  $W/code.tar" | sha256sum -c - >/dev/null
+tar -xf "$W/code.tar" -C "$W/src"
 
 cd "$W/src"
 timeout 600 godot --headless --path . --import > "$W/out/import.log" 2>&1 || true
