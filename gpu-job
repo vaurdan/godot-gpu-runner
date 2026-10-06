@@ -16,9 +16,10 @@ mkdir -p "$OUT"; LOG="$OUT/gpu-job.log"; exec > >(tee -a "$LOG") 2>&1
 echo "run $RUN_ID repo=$REPO sha=$SHA sub=$SUB args=$*"
 
 # 1. pack exact revision (cached per tree in B2)
-TREE=$(git -C "$REPO" rev-parse "$SHA:${SUB#./}" 2>/dev/null || git -C "$REPO" rev-parse "$SHA^{tree}")
+SUB=${SUB#./}; [ "$SUB" = . ] && SUB=""
+TREEISH="$SHA${SUB:+:$SUB}" 
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
-git -C "$REPO" archive --format=tar "$TREE" | gzip -n -1 > "$TMP/code.tar.gz"
+git -C "$REPO" archive --mtime="@$(git -C "$REPO" log -1 --format=%ct "$SHA")" --format=tar "$TREEISH" | gzip -n -1 > "$TMP/code.tar.gz"
 CSHA=$(sha256sum "$TMP/code.tar.gz" | cut -d' ' -f1)
 read -r GET PUT < <(python3 - "$TMP/code.tar.gz" "$CSHA" "$RUN_ID" <<'EOF'
 import os, sys, boto3

@@ -2,12 +2,13 @@
 # Usage: run-job <code_url> <code_sha256> <upload_url> -- <godot args...>
 # code_url / upload_url are short-lived presigned URLs; no credentials live on the machine.
 set -euo pipefail
+trap 'echo "run-job failed at line $LINENO: $BASH_COMMAND" >&2' ERR
 CODE_URL=$1; CODE_SHA=$2; UPLOAD_URL=$3; shift 3; [ "${1:-}" = "--" ] && shift
 W=/job; rm -rf "$W"; mkdir -p "$W/src" "$W/out"
 
 pgrep -x Xvfb >/dev/null || { Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 & sleep 1; }
 { nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
-  vulkaninfo --summary 2>/dev/null | grep -m1 deviceName; } > "$W/out/gpu.txt"
+  vulkaninfo --summary 2>/dev/null | grep deviceName || true; } > "$W/out/gpu.txt"
 grep -q 'deviceName.*NVIDIA' "$W/out/gpu.txt" || { echo "no NVIDIA Vulkan device" >&2; exit 2; }
 
 curl -fsS -o "$W/code.tar" "$CODE_URL"
