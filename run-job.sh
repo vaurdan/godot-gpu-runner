@@ -15,6 +15,11 @@ echo "$CODE_SHA  $W/code.tar" | sha256sum -c - >/dev/null
 tar -xf "$W/code.tar" -C "$W/src"
 
 cd "$W/src"
+# Movie Maker records at the project viewport size and ignores --resolution; mirror it into override.cfg.
+RES=$(printf '%s\n' "$@" | grep -A1 -x -- --resolution | tail -1 | grep -xE '[0-9]+x[0-9]+' || true)
+if [ -n "$RES" ]; then
+  printf '\n[display]\nwindow/size/viewport_width=%s\nwindow/size/viewport_height=%s\n' "${RES%x*}" "${RES#*x}" >> override.cfg
+fi
 timeout 600 godot --headless --path . --import > "$W/out/import.log" 2>&1 || true
 set +e
 timeout "${JOB_TIMEOUT:-1800}" godot --path . --rendering-driver vulkan --disable-vsync "$@" > "$W/out/run.log" 2>&1
