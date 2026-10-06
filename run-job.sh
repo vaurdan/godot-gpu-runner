@@ -9,7 +9,13 @@ W=/job; rm -rf "$W"; mkdir -p "$W/src" "$W/out"
 pgrep -x Xvfb >/dev/null || { Xvfb :99 -screen 0 1920x1080x24 >/dev/null 2>&1 & sleep 1; }
 { nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
   vulkaninfo --summary 2>/dev/null | grep deviceName || true; } > "$W/out/gpu.txt"
-grep -q 'deviceName.*NVIDIA' "$W/out/gpu.txt" || { echo "no NVIDIA Vulkan device" >&2; exit 2; }
+upload() { tar -C "$W/out" -czf "$W/result.tgz" . && curl -fsS -X PUT --upload-file "$W/result.tgz" "$UPLOAD_URL"; }
+if ! grep -q 'deviceName.*NVIDIA' "$W/out/gpu.txt"; then
+  { echo "== vulkaninfo"; vulkaninfo --summary 2>&1 | head -60; echo "== icd"; ls -la /etc/vulkan/icd.d /usr/share/vulkan/icd.d 2>&1; cat /etc/vulkan/icd.d/*.json 2>&1;
+    echo "== libs"; ls /usr/lib/x86_64-linux-gnu | grep -iE 'nvidia|GLX' 2>&1; echo "== env"; env | grep -E '^NVIDIA_'; } > "$W/out/gpu-diag.txt" 2>&1
+  echo 2 > "$W/out/exit_code"; upload || true
+  echo "no NVIDIA Vulkan device (diag in gpu-diag.txt)" >&2; exit 2
+fi
 
 curl -fsS -o "$W/code.tar" "$CODE_URL"
 echo "$CODE_SHA  $W/code.tar" | sha256sum -c - >/dev/null
@@ -29,6 +35,5 @@ echo $? > "$W/out/exit_code"
 set -e
 
 for f in "$W"/out/*.avi; do [ -e "$f" ] && ffmpeg -loglevel error -y -i "$f" -c:v libx264 -crf 20 -pix_fmt yuv420p "${f%.avi}.mp4" && rm "$f"; done
-tar -C "$W/out" -czf "$W/result.tgz" .
-curl -fsS -X PUT --upload-file "$W/result.tgz" "$UPLOAD_URL"
+upload
 cat "$W/out/exit_code"
