@@ -1,0 +1,105 @@
+#!/bin/bash
+# gpu-job-once: ONE attempt of a Godot job on a disposable Vast.ai GPU. Normally called by gpu-job,
+# which retries infrastructure failures. Exit codes: 69 no offer, 75 never running,
+# 76 result missing (host/network died), 77 no NVIDIA Vulkan device; anything else is not retried.
+# Usage: gpu-job-once <repo_dir> <full_commit_sha> <project_subdir|.> <out_dir> -- <godot args...>
+# Example: gpu-job /root/workspace/night-shift 3f2a...40hex game /root/runs/x -- \
+#            --resolution 1920x1080 --fixed-fps 30 --write-movie /job/out/run.avi --quit-after 300
+# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.15), GPU_TTL (safety-net seconds, default 2700),
+#      JOB_TIMEOUT (godot run limit on the host, default 1800, max 6600 = reaper 120 min minus setup; GPU_TTL is raised to fit it)
+set -euo pipefail
+REPO=$1; SHA=$2; SUB=$3; OUT=$4; shift 4; [ "${1:-}" = "--" ] && shift
+[[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full 40-char commit SHA, not a branch" >&2; exit 64; }
+V=/root/.venvs/vast/bin/vastai; KEY=/root/.ssh/vast_ed25519
+set -a; . /root/.config/b2/godot-gpu-queue.env; set +a
+QUERY=${GPU_QUERY:-"gpu_name in [RTX_3060,RTX_3060_Ti,RTX_3070] num_gpus=1 reliability>0.98 rentable=true inet_down>500 disk_space>=20"}
+MAXDPH=${GPU_MAX_DPH:-0.15}; JOBT=${JOB_TIMEOUT:-1800}; TTL=${GPU_TTL:-2700}
+# vast-reaper destroys instances older than 120 min: cap the godot run so setup + run + upload finish first
+[ "$JOBT" -gt 6600 ] && { echo "JOB_TIMEOUT $JOBT capped to 6600 s (vast-reaper limit 120 min)" >&2; JOBT=6600; }
+[ "$TTL" -lt $((JOBT + 1200)) ] && TTL=$((JOBT + 1200))
+export URL_TTL=$((TTL + 600))
+# machines with >=2 infrastructure failures in 24 h, plus those that already failed this job (GPU_EXCLUDE)
+BAD=/var/lib/gpu-job/bad-machines.log; mkdir -p "${BAD%/*}"; touch "$BAD"
+SKIP=$(awk -v t=$(( $(date +%s) - 86400 )) '$1>=t{c[$2]++} END{for(m in c) if(c[m]>=2) printf "%s ", m}' "$BAD")
+SKIP="$SKIP ${GPU_EXCLUDE:-}"
+RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-${SHA:0:12}-$$
+mkdir -p "$OUT"; LOG="$OUT/gpu-job.log"; exec > >(tee -a "$LOG") 2>&1
+echo "run $RUN_ID repo=$REPO sha=$SHA sub=$SUB args=$*"
+
+# 1. pack exact revision (cached per tree in B2)
+SUB=${SUB#./}; [ "$SUB" = . ] && SUB=""
+TREEISH="$SHA${SUB:+:$SUB}" 
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+git -C "$REPO" archive --mtime="@$(git -C "$REPO" log -1 --format=%ct "$SHA")" --format=tar "$TREEISH" | gzip -n -1 > "$TMP/code.tar.gz"
+CSHA=$(sha256sum "$TMP/code.tar.gz" | cut -d' ' -f1)
+read -r GET PUT < <(python3 - "$TMP/code.tar.gz" "$CSHA" "$RUN_ID" <<'EOF'
+import os, sys, boto3
+from botocore.exceptions import ClientError
+s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
+                  aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
+B, f, h, rid = os.environ['B2_BUCKET'], sys.argv[1], sys.argv[2], sys.argv[3]
+k = f'code/{h}.tar.gz'
+try: s3.head_object(Bucket=B, Key=k)
+except ClientError: s3.upload_file(f, B, k)
+g = s3.generate_presigned_url('get_object', Params={'Bucket': B, 'Key': k}, ExpiresIn=int(os.environ['URL_TTL']))
+p = s3.generate_presigned_url('put_object', Params={'Bucket': B, 'Key': f'runs/{rid}/result.tgz'}, ExpiresIn=int(os.environ['URL_TTL']))
+print(g, p)
+EOF
+)
+echo "code archive sha256=$CSHA"
+
+# 2. rent, with safety net
+read -r OFFER MID < <($V search offers "$QUERY" -o dph_total --raw | python3 -c "
+import json,sys,os
+skip=set('$SKIP'.split())
+o=[x for x in json.load(sys.stdin) if ('${GPU_MACHINE:-}'=='' or str(x.get('machine_id'))=='${GPU_MACHINE:-}') and str(x.get('machine_id')) not in skip and x['dph_total']<=float('$MAXDPH') and int(str(x.get('driver_version') or '0').split('.')[0])>=int('${GPU_MIN_DRIVER:-535}')]
+# RTX 3060 is the graphics baseline; 3060 Ti / 3070 only when no 3060 is available
+o.sort(key=lambda x: (x.get('gpu_name')!='RTX 3060', x['dph_total']))
+print(o[0]['id'], o[0].get('machine_id')) if o else print('')
+if o: print('host: machine=%s gpu=%s cpu=%s cores=%s ghz=%s ram_gb=%s' % (o[0].get('machine_id'), o[0].get('gpu_name'), o[0].get('cpu_name'), o[0].get('cpu_cores_effective'), o[0].get('cpu_ghz'), round((o[0].get('cpu_ram') or 0)/1024)), file=sys.stderr)
+if skip: print('skipping machines: ' + ' '.join(sorted(skip)), file=sys.stderr)") || true
+[ -n "${OFFER:-}" ] || { echo "no offer under $MAXDPH USD/h for: $QUERY" >&2; exit 69; }
+# pin the image by digest so hosts never run a stale cached :4.7.2
+TOK=$(curl -fsS "https://ghcr.io/token?scope=repository:vaurdan/godot-gpu-runner:pull" | python3 -c "import json,sys;print(json.load(sys.stdin)['token'])")
+DIGEST=$(curl -fsSI -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
+  https://ghcr.io/v2/vaurdan/godot-gpu-runner/manifests/${GPU_IMAGE_TAG:-4.7.2} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+[ -n "$DIGEST" ] || { echo "cannot resolve image digest" >&2; exit 69; }
+echo "image ghcr.io/vaurdan/godot-gpu-runner@$DIGEST"
+IID=$($V create instance "$OFFER" --image "ghcr.io/vaurdan/godot-gpu-runner@$DIGEST" --disk 20 --ssh --direct \
+      --env '-e NVIDIA_DRIVER_CAPABILITIES=all' --label "gpu-job-$RUN_ID" --raw | python3 -c "import json,sys;print(json.load(sys.stdin)['new_contract'])")
+echo "instance $IID (offer $OFFER, machine $MID)"
+infra_fail() { echo "$(date +%s) $MID $2" >> "$BAD"; echo "$MID" > "$OUT/.failed-machine"; echo "INFRA-FAIL machine=$MID: $2" >&2; exit "$1"; }
+( sleep "$TTL"; $V destroy instance "$IID" -y ) >/dev/null 2>&1 &
+NET=$!
+cleanup() { $V destroy instance "$IID" -y >/dev/null 2>&1 || true; kill "$NET" 2>/dev/null || true; rm -rf "$TMP"; echo "instance $IID destroyed"; }
+trap cleanup EXIT
+
+# 3. wait for SSH
+for i in $(seq 1 60); do
+  read -r ST IP PORT < <($V show instance "$IID" --raw | python3 -c "
+import json,sys;d=json.load(sys.stdin);p=((d.get('ports') or {}).get('22/tcp') or [{}])[0].get('HostPort');print(d.get('actual_status'),d.get('public_ipaddr'),p)")
+  [ "$ST" = running ] && [ "$PORT" != None ] && break; sleep 10
+done
+[ "$ST" = running ] || infra_fail 75 never_running
+SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o LogLevel=ERROR -p $PORT root@$IP"
+for i in $(seq 1 12); do $SSH true 2>/dev/null && break; sleep 5; done
+
+# 4. run (args are quoted for the remote shell)
+ARGS=$(printf '%q ' "$@")
+set +e; $SSH "rm -f /root/.vast_api_key; JOB_TIMEOUT=$JOBT run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
+echo "remote rc=$RC"
+
+# 5. fetch result
+python3 - "$RUN_ID" "$OUT/result.tgz" <<'EOF' || infra_fail 76 "result_missing(rc=$RC)"
+import os, sys, boto3
+s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
+                  aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
+s3.download_file(os.environ['B2_BUCKET'], f'runs/{sys.argv[1]}/result.tgz', sys.argv[2])
+EOF
+tar -xzf "$OUT/result.tgz" -C "$OUT" && rm -f "$OUT/result.tgz"   # B2 keeps the original ~30 d
+# raw Movie Maker .avi is huge; drop it once run.mp4 exists (GPU_KEEP_RAW=1 keeps it)
+[ "${GPU_KEEP_RAW:-0}" = 1 ] || { [ -s "$OUT/run.mp4" ] && find "$OUT" -maxdepth 2 -name '*.avi' -delete; }
+[ -f "$OUT/gpu-diag.txt" ] && { echo '--- gpu-diag (no NVIDIA Vulkan) ---'; head -40 "$OUT/gpu-diag.txt"; mv "$OUT/gpu-diag.txt" "$OUT/gpu-diag-$MID.txt"; infra_fail 77 no_vulkan; }
+echo "gpu: $(tr '\n' ' ' < "$OUT/gpu.txt")"; echo "godot exit: $(cat "$OUT/exit_code")"
+grep -m1 'Using Device' "$OUT/run.log" || true
+echo "artifacts: $OUT  (B2 runs/$RUN_ID, expires ~30 d)"
