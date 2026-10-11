@@ -6,7 +6,9 @@
 # Example: gpu-job /root/workspace/night-shift 3f2a...40hex game /root/runs/x -- \
 #            --resolution 1920x1080 --fixed-fps 30 --write-movie /job/out/run.avi --quit-after 300
 # Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.15), GPU_TTL (safety-net seconds, default 2700),
-#      JOB_TIMEOUT (godot run limit on the host, default 1800, max 6600 = reaper 120 min minus setup; GPU_TTL is raised to fit it)
+#      JOB_TIMEOUT (godot run limit on the host, default 1800, max 6600 = reaper 120 min minus setup; GPU_TTL is raised to fit it),
+#      GPU_IMAGE_TAG (runner image tag or sha256:<digest>, default 4.7.2), RUNNER_DISPLAY (xorg|xvfb, passed to run-job; unset = the
+#      image's default: xorg on a real NVIDIA X display with automatic fallback to Xvfb; the display used is the last line of gpu.txt)
 set -euo pipefail
 REPO=$1; SHA=$2; SUB=$3; OUT=$4; shift 4; [ "${1:-}" = "--" ] && shift
 [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "need a full 40-char commit SHA, not a branch" >&2; exit 64; }
@@ -17,6 +19,7 @@ MAXDPH=${GPU_MAX_DPH:-0.15}; JOBT=${JOB_TIMEOUT:-1800}; TTL=${GPU_TTL:-2700}
 # vast-reaper destroys instances older than 120 min: cap the godot run so setup + run + upload finish first
 [ "$JOBT" -gt 6600 ] && { echo "JOB_TIMEOUT $JOBT capped to 6600 s (vast-reaper limit 120 min)" >&2; JOBT=6600; }
 [ "$TTL" -lt $((JOBT + 1200)) ] && TTL=$((JOBT + 1200))
+case ${RUNNER_DISPLAY:-} in ""|xorg|xvfb) ;; *) echo "RUNNER_DISPLAY must be xorg or xvfb" >&2; exit 64 ;; esac
 export URL_TTL=$((TTL + 600))
 # machines with >=2 infrastructure failures in 24 h, plus those that already failed this job (GPU_EXCLUDE)
 BAD=/var/lib/gpu-job/bad-machines.log; mkdir -p "${BAD%/*}"; touch "$BAD"
@@ -64,7 +67,7 @@ TOK=$(curl -fsS "https://ghcr.io/token?scope=repository:vaurdan/godot-gpu-runner
 DIGEST=$(curl -fsSI -H "Authorization: Bearer $TOK" -H "Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json" \
   https://ghcr.io/v2/vaurdan/godot-gpu-runner/manifests/${GPU_IMAGE_TAG:-4.7.2} | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
 [ -n "$DIGEST" ] || { echo "cannot resolve image digest" >&2; exit 69; }
-echo "image ghcr.io/vaurdan/godot-gpu-runner@$DIGEST"
+echo "image ghcr.io/vaurdan/godot-gpu-runner@$DIGEST (${GPU_IMAGE_TAG:-4.7.2})${RUNNER_DISPLAY:+ RUNNER_DISPLAY=$RUNNER_DISPLAY}"
 IID=$($V create instance "$OFFER" --image "ghcr.io/vaurdan/godot-gpu-runner@$DIGEST" --disk 20 --ssh --direct \
       --env '-e NVIDIA_DRIVER_CAPABILITIES=all' --label "gpu-job-$RUN_ID" --raw | python3 -c "import json,sys;print(json.load(sys.stdin)['new_contract'])")
 echo "instance $IID (offer $OFFER, machine $MID)"
@@ -86,7 +89,7 @@ for i in $(seq 1 12); do $SSH true 2>/dev/null && break; sleep 5; done
 
 # 4. run (args are quoted for the remote shell)
 ARGS=$(printf '%q ' "$@")
-set +e; $SSH "rm -f /root/.vast_api_key; JOB_TIMEOUT=$JOBT run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
+set +e; $SSH "rm -f /root/.vast_api_key; JOB_TIMEOUT=$JOBT ${RUNNER_DISPLAY:+RUNNER_DISPLAY=$RUNNER_DISPLAY }run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
 echo "remote rc=$RC"
 
 # 5. fetch result (on failure, pull the instance's own logs first: the trap destroys it on exit)
@@ -107,6 +110,11 @@ tar -xzf "$OUT/result.tgz" -C "$OUT" && rm -f "$OUT/result.tgz"   # B2 keeps the
 # raw Movie Maker .avi is huge; drop it once run.mp4 exists (GPU_KEEP_RAW=1 keeps it)
 [ "${GPU_KEEP_RAW:-0}" = 1 ] || { [ -s "$OUT/run.mp4" ] && find "$OUT" -maxdepth 2 -name '*.avi' -delete; }
 [ -f "$OUT/gpu-diag.txt" ] && { echo '--- gpu-diag (no NVIDIA Vulkan) ---'; head -40 "$OUT/gpu-diag.txt"; mv "$OUT/gpu-diag.txt" "$OUT/gpu-diag-$MID.txt"; infra_fail 77 no_vulkan; }
+# godot could not create the Vulkan device or any display at all: a host problem, not the project's (retried elsewhere)
+if [ "$(cat "$OUT/exit_code" 2>/dev/null)" != 0 ] && grep -qE "Couldn't create Vulkan device|Unable to create DisplayServer" "$OUT/run.log" 2>/dev/null; then
+  mkdir -p "$OUT/remote-logs"; cp "$OUT/run.log" "$OUT/remote-logs/run-$MID.log"
+  echo "--- godot could not start ($(tail -1 "$OUT/gpu.txt")) ---"; grep -m3 -E "^ERROR" "$OUT/run.log"; infra_fail 77 godot_no_vulkan_device
+fi
 echo "gpu: $(tr '\n' ' ' < "$OUT/gpu.txt")"; echo "godot exit: $(cat "$OUT/exit_code")"
 grep -m1 'Using Device' "$OUT/run.log" || true
 echo "artifacts: $OUT  (B2 runs/$RUN_ID, expires ~30 d)"
