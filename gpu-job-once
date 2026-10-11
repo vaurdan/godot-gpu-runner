@@ -110,6 +110,11 @@ tar -xzf "$OUT/result.tgz" -C "$OUT" && rm -f "$OUT/result.tgz"   # B2 keeps the
 # raw Movie Maker .avi is huge; drop it once run.mp4 exists (GPU_KEEP_RAW=1 keeps it)
 [ "${GPU_KEEP_RAW:-0}" = 1 ] || { [ -s "$OUT/run.mp4" ] && find "$OUT" -maxdepth 2 -name '*.avi' -delete; }
 [ -f "$OUT/gpu-diag.txt" ] && { echo '--- gpu-diag (no NVIDIA Vulkan) ---'; head -40 "$OUT/gpu-diag.txt"; mv "$OUT/gpu-diag.txt" "$OUT/gpu-diag-$MID.txt"; infra_fail 77 no_vulkan; }
+# godot could not create the Vulkan device or any display at all: a host problem, not the project's (retried elsewhere)
+if [ "$(cat "$OUT/exit_code" 2>/dev/null)" != 0 ] && grep -qE "Couldn't create Vulkan device|Unable to create DisplayServer" "$OUT/run.log" 2>/dev/null; then
+  mkdir -p "$OUT/remote-logs"; cp "$OUT/run.log" "$OUT/remote-logs/run-$MID.log"
+  echo "--- godot could not start ($(tail -1 "$OUT/gpu.txt")) ---"; grep -m3 -E "^ERROR" "$OUT/run.log"; infra_fail 77 godot_no_vulkan_device
+fi
 echo "gpu: $(tr '\n' ' ' < "$OUT/gpu.txt")"; echo "godot exit: $(cat "$OUT/exit_code")"
 grep -m1 'Using Device' "$OUT/run.log" || true
 echo "artifacts: $OUT  (B2 runs/$RUN_ID, expires ~30 d)"
