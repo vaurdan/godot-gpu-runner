@@ -1,8 +1,9 @@
 name: build-image
 # push to main         -> :4.7.2 and :sha-<sha> (what gpu-job uses by default)
 # push to stage/<name> -> :4.7.2-<name> and :sha-<sha> (staging; :4.7.2 does not move)
-# workflow_dispatch with promote=<tag|sha256:digest> -> no build: the current :4.7.2 is copied to :<backup_as>, then the
-#   given image is copied to :4.7.2 (same digest), so a validated staging image becomes the default without a rebuild
+# workflow_dispatch with promote=<tag|sha256:digest> -> no build: the image now under :<target> (default 4.7.2) is also tagged
+#   :<backup_as>, then the given image is tagged :<target> (same digest), so a validated staging image becomes the default
+#   without a rebuild
 on:
   push:
     branches: [main, 'stage/**']
@@ -13,9 +14,13 @@ on:
         required: false
         default: ''
       backup_as:
-        description: 'Tag that keeps the previous :4.7.2 (rollback with GPU_IMAGE_TAG=<this>)'
+        description: 'Tag that keeps the image previously under the target tag (rollback with GPU_IMAGE_TAG=<this>; empty = no backup)'
         required: false
         default: '4.7.2-prev'
+      target:
+        description: 'Tag to move (default 4.7.2)'
+        required: false
+        default: '4.7.2'
 permissions:
   contents: read
   packages: write
@@ -49,18 +54,19 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/setup-buildx-action@v3
       - env:
           SRC: ${{ inputs.promote }}
           BAK: ${{ inputs.backup_as }}
+          TGT: ${{ inputs.target }}
         run: |
           set -eu
-          R=ghcr.io/${{ github.repository_owner }}/godot-gpu-runner
+          # crane tag adds a tag to the existing manifest: the digest is kept exactly (imagetools create re-wraps it)
+          curl -fsSL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz | tar -xz -C "$RUNNER_TEMP" crane
+          C=$RUNNER_TEMP/crane; R=ghcr.io/${{ github.repository_owner }}/godot-gpu-runner; T=${TGT:-4.7.2}
           case $SRC in sha256:*) S="$R@$SRC" ;; *) S="$R:$SRC" ;; esac
-          dig() { docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["digest"])'; }
-          OLD=$(dig "$R:4.7.2"); NEW=$(dig "$S")
-          echo "old :4.7.2 = $OLD"; echo "new $SRC = $NEW"
-          docker buildx imagetools create -t "$R:$BAK" "$R@$OLD"
-          docker buildx imagetools create -t "$R:4.7.2" "$R@$NEW"
-          echo "now :4.7.2 = $(dig "$R:4.7.2"), :$BAK = $(dig "$R:$BAK")"
-          [ "$(dig "$R:4.7.2")" = "$NEW" ] && [ "$(dig "$R:$BAK")" = "$OLD" ]
+          NEW=$($C digest "$S"); OLD=$($C digest "$R:$T" 2>/dev/null || true)
+          echo "old :$T = ${OLD:-none}"; echo "new $SRC = $NEW"
+          if [ -n "$BAK" ] && [ -n "$OLD" ]; then $C tag "$R@$OLD" "$BAK"; [ "$($C digest "$R:$BAK")" = "$OLD" ]; fi
+          $C tag "$R@$NEW" "$T"
+          echo "now :$T = $($C digest "$R:$T")${BAK:+, :$BAK = $($C digest "$R:$BAK" 2>/dev/null)}"
+          [ "$($C digest "$R:$T")" = "$NEW" ]

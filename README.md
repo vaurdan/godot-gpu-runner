@@ -53,7 +53,7 @@ a stale cached tag. `GPU_IMAGE_TAG` also accepts `sha256:<digest>` and `sha-<com
 |---|---|
 | push to `main` | `:4.7.2`, `:sha-<commit>` |
 | push to `stage/<name>` | `:4.7.2-<name>`, `:sha-<commit>`; `:4.7.2` does not move |
-| Actions, build-image, `workflow_dispatch` with `promote=<tag or sha256:digest>` | no build: the current `:4.7.2` is copied to `:<backup_as>` (default `4.7.2-prev`), then the given image is copied to `:4.7.2` with the same digest |
+| Actions, build-image, `workflow_dispatch` with `promote=<tag or sha256:digest>` | no build: the image now under `:<target>` (default `4.7.2`) is also tagged `:<backup_as>` (default `4.7.2-prev`, empty = none), then the given image is tagged `:<target>`; digests are kept exactly (`crane tag`) |
 
 To validate an image change without touching other users: push it to `stage/<name>`, run jobs with
 `GPU_IMAGE_TAG=4.7.2-<name>`, then promote the validated digest with
