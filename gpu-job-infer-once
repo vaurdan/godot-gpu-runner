@@ -1,0 +1,141 @@
+#!/bin/bash
+# gpu-job-infer-once: ONE attempt of a generic ML inference job on a disposable Vast.ai GPU (any public image).
+# Normally called by gpu-job-infer, which retries infrastructure failures. Exit codes as gpu-job-once:
+# 69 no offer, 75 never running, 76 result missing (host/network died), 78 remote bootstrap failed (no python/curl,
+# asset download); anything else (the remote command's own exit code is in out/exit_code) is not retried.
+# Usage: gpu-job-infer-once <image> <inputs_dir> <out_dir> -- <remote shell command>
+#   inputs_dir is packed and unpacked at /job/in; the command runs with cwd /job, writes results to /job/out.
+#   INFER_ASSETS="name=/local/dir name2=/local/dir2": big read-only dirs (model weights), packed once and cached in B2 by
+#   sha256 (assets/<sha>.tar), unpacked at /job/assets/<name>. Credentials never leave this host: the instance only gets
+#   presigned GET/PUT URLs; /root/.vast_api_key is deleted on the instance before anything runs.
+# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.25), GPU_DISK (GB, default 40), GPU_TTL (safety net s, default 3600),
+#      JOB_TIMEOUT (remote command limit s, default 1800, max 6600 = vast-reaper 120 min minus setup), GPU_MIN_DRIVER (550),
+#      GPU_MACHINE / GPU_EXCLUDE (as gpu-job-once). Machine blacklist shared with gpu-job: /var/lib/gpu-job/bad-machines.log.
+# The instance label is gpu-job-<RUN_ID> with RUN_ID ending in this script's pid and the script name contains "gpu-job":
+# vast-reaper (every 10 min) keeps it alive only while this process lives, and kills anything older than 120 min.
+set -euo pipefail
+IMAGE=$1; IN=$2; OUT=$3; shift 3; [ "${1:-}" = "--" ] && shift
+CMD="$*"; [ -n "$CMD" ] || { echo "need a remote command after --" >&2; exit 64; }
+[ -d "$IN" ] || { echo "inputs_dir $IN is not a directory" >&2; exit 64; }
+V=/root/.venvs/vast/bin/vastai; KEY=/root/.ssh/vast_ed25519
+set -a; . /root/.config/b2/godot-gpu-queue.env; set +a
+QUERY=${GPU_QUERY:-"num_gpus=1 gpu_ram>=20 reliability>0.98 rentable=true inet_down>500 disk_space>=${GPU_DISK:-40} cuda_vers>=12.4"}
+MAXDPH=${GPU_MAX_DPH:-0.25}; JOBT=${JOB_TIMEOUT:-1800}; TTL=${GPU_TTL:-3600}
+[ "$JOBT" -gt 6600 ] && { echo "JOB_TIMEOUT $JOBT capped to 6600 s (vast-reaper limit 120 min)" >&2; JOBT=6600; }
+[ "$TTL" -lt $((JOBT + 1200)) ] && TTL=$((JOBT + 1200))
+export URL_TTL=$((TTL + 600))
+BAD=/var/lib/gpu-job/bad-machines.log; mkdir -p "${BAD%/*}"; touch "$BAD"
+SKIP=$(awk -v t=$(( $(date +%s) - 86400 )) '$1>=t{c[$2]++} END{for(m in c) if(c[m]>=2) printf "%s ", m}' "$BAD")
+SKIP="$SKIP ${GPU_EXCLUDE:-}"
+RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)-infer-$$
+mkdir -p "$OUT"; LOG="$OUT/gpu-job.log"; exec > >(tee -a "$LOG") 2>&1
+echo "run $RUN_ID image=$IMAGE inputs=$IN assets=${INFER_ASSETS:-none} cmd=$CMD"
+
+# 1. pack inputs (+ assets, cached by sha256 in B2) and presign
+TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+tar -C "$IN" --sort=name --mtime=@0 --owner=0 --group=0 -cf - . | gzip -n -1 > "$TMP/in.tar.gz"
+ASSET_ARGS=()
+for a in ${INFER_ASSETS:-}; do
+  n=${a%%=*}; d=${a#*=}; [ -d "$d" ] || { echo "asset $n: $d is not a directory" >&2; exit 64; }
+  # uncompressed tar (weights do not compress); the per-dir cache file avoids re-hashing gigabytes on every run
+  stamp=$(find "$d" -type f -printf '%P %s %T@\n' | sort | sha256sum | cut -c1-16)
+  cache=/var/lib/gpu-job/asset-cache/$n-$stamp.sha
+  if [ -s "$cache" ]; then h=$(cat "$cache"); echo "asset $n: cached sha256=$h"
+  else tar -C "$d" --sort=name --mtime=@0 --owner=0 --group=0 -cf "$TMP/$n.tar" .; h=$(sha256sum "$TMP/$n.tar" | cut -d' ' -f1)
+       mkdir -p "${cache%/*}"; echo "$h" > "$cache"; echo "asset $n: packed sha256=$h ($(du -h "$TMP/$n.tar" | cut -f1))"; fi
+  ASSET_ARGS+=("$n" "$h" "$TMP/$n.tar")
+done
+mapfile -t URLS < <(python3 - "$TMP/in.tar.gz" "$RUN_ID" "${ASSET_ARGS[@]}" <<'EOF'
+import os, sys, boto3
+from botocore.exceptions import ClientError
+from boto3.s3.transfer import TransferConfig
+s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
+                  aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
+B, ttl = os.environ['B2_BUCKET'], int(os.environ['URL_TTL'])
+inp, rid, rest = sys.argv[1], sys.argv[2], sys.argv[3:]
+sign = lambda op, k: s3.generate_presigned_url(op, Params={'Bucket': B, 'Key': k}, ExpiresIn=ttl)
+s3.upload_file(inp, B, f'runs/{rid}/in.tar.gz')
+print(sign('get_object', f'runs/{rid}/in.tar.gz'))
+print(sign('put_object', f'runs/{rid}/result.tgz'))
+for i in range(0, len(rest), 3):
+    n, h, f = rest[i:i + 3]
+    k = f'assets/{h}.tar'
+    try: s3.head_object(Bucket=B, Key=k)
+    except ClientError:
+        print(f'uploading asset {n} -> {k}', file=sys.stderr)
+        s3.upload_file(f, B, k, Config=TransferConfig(multipart_chunksize=256 * 1024 * 1024, max_concurrency=8))
+    print(f'{n} {h} ' + sign('get_object', k))
+EOF
+)
+rm -f "$TMP"/*.tar
+[ "${#URLS[@]}" -ge $((2 + ${#ASSET_ARGS[@]} / 3)) ] || { echo "B2 upload/presign failed" >&2; exit 70; }
+IN_GET=${URLS[0]}; PUT=${URLS[1]}; ASSET_LINES=("${URLS[@]:2}")
+
+# 2. rent, with safety net
+read -r OFFER MID < <($V search offers "$QUERY" -o dph_total --raw | python3 -c "
+import json,sys
+skip=set('$SKIP'.split())
+o=[x for x in json.load(sys.stdin) if ('${GPU_MACHINE:-}'=='' or str(x.get('machine_id'))=='${GPU_MACHINE:-}') and str(x.get('machine_id')) not in skip and x['dph_total']<=float('$MAXDPH') and int(str(x.get('driver_version') or '0').split('.')[0])>=int('${GPU_MIN_DRIVER:-550}')]
+o.sort(key=lambda x: x['dph_total'])
+print(o[0]['id'], o[0].get('machine_id')) if o else print('')
+if o: print('host: machine=%s gpu=%s vram_gb=%s dph=%.3f driver=%s geo=%s' % (o[0].get('machine_id'), o[0].get('gpu_name'), round((o[0].get('gpu_ram') or 0)/1024), o[0]['dph_total'], o[0].get('driver_version'), o[0].get('geolocation')), file=sys.stderr)
+if skip: print('skipping machines: ' + ' '.join(sorted(skip)), file=sys.stderr)") || true
+[ -n "${OFFER:-}" ] || { echo "no offer under $MAXDPH USD/h for: $QUERY" >&2; exit 69; }
+IID=$($V create instance "$OFFER" --image "$IMAGE" --disk "${GPU_DISK:-40}" --ssh --direct \
+      --label "gpu-job-$RUN_ID" --raw | python3 -c "import json,sys;print(json.load(sys.stdin)['new_contract'])")
+T0=$(date +%s)
+echo "instance $IID (offer $OFFER, machine $MID)"
+infra_fail() { echo "$(date +%s) $MID $2" >> "$BAD"; echo "$MID" > "$OUT/.failed-machine"; echo "INFRA-FAIL machine=$MID: $2" >&2; exit "$1"; }
+( sleep "$TTL"; $V destroy instance "$IID" -y ) >/dev/null 2>&1 &
+NET=$!
+cleanup() { $V destroy instance "$IID" -y >/dev/null 2>&1 || true; kill "$NET" 2>/dev/null || true; rm -rf "$TMP"; echo "instance $IID destroyed after $(( $(date +%s) - T0 )) s"; }
+trap cleanup EXIT
+
+# 3. wait for SSH (image pull included)
+for i in $(seq 1 90); do
+  read -r ST IP PORT < <($V show instance "$IID" --raw | python3 -c "
+import json,sys;d=json.load(sys.stdin);p=((d.get('ports') or {}).get('22/tcp') or [{}])[0].get('HostPort');print(d.get('actual_status'),d.get('public_ipaddr'),p)")
+  [ "$ST" = running ] && [ "$PORT" != None ] && break; sleep 10
+done
+[ "$ST" = running ] || infra_fail 75 never_running
+SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o ServerAliveInterval=30 -o LogLevel=ERROR -p $PORT root@$IP"
+for i in $(seq 1 12); do $SSH true 2>/dev/null && break; sleep 5; done
+echo "ssh up after $(( $(date +%s) - T0 )) s"
+
+# 4. bootstrap (python stdlib only: no curl needed in the image), run, upload. Exit 78 = bootstrap failed (infra).
+BOOT=$(cat <<'EOF'
+set -u; rm -f /root/.vast_api_key
+W=/job; rm -rf $W; mkdir -p $W/in $W/out $W/assets; cd $W
+PY=$(command -v python3 || command -v python) || { echo "no python in image" >&2; exit 78; }
+get() { "$PY" -c 'import sys,urllib.request,shutil;r=urllib.request.urlopen(sys.argv[1],timeout=120);shutil.copyfileobj(r,open(sys.argv[2],"wb"),1<<24)' "$1" "$2"; }
+get "$IN_GET" $W/in.tar.gz && tar -xzf $W/in.tar.gz -C $W/in && rm $W/in.tar.gz || { echo "inputs download failed" >&2; exit 78; }
+while read -r n h u; do [ -n "$n" ] || continue; mkdir -p $W/assets/$n
+  get "$u" $W/assets/$n.tar && echo "$h  $W/assets/$n.tar" | sha256sum -c - >/dev/null && tar -xf $W/assets/$n.tar -C $W/assets/$n && rm $W/assets/$n.tar \
+    || { echo "asset $n download/verify failed" >&2; exit 78; }
+  echo "asset $n ready ($(du -sh $W/assets/$n | cut -f1))"
+done <<< "$ASSETS"
+nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader > $W/out/gpu.txt 2>&1 || true
+echo "bootstrap done at $(date -u +%T)"
+set +e; timeout "$JOBT" bash -c "$CMD" > $W/out/run.log 2>&1; echo $? > $W/out/exit_code; set -e
+tail -20 $W/out/run.log
+tar -C $W/out -czf $W/result.tgz . && "$PY" -c 'import sys,urllib.request;d=open(sys.argv[2],"rb").read();urllib.request.urlopen(urllib.request.Request(sys.argv[1],data=d,method="PUT"),timeout=600)' "$PUT" $W/result.tgz
+cat $W/out/exit_code
+EOF
+)
+ASSETS=$(printf '%s\n' "${ASSET_LINES[@]+"${ASSET_LINES[@]}"}")
+set +e
+printf 'IN_GET=%q\nPUT=%q\nASSETS=%q\nJOBT=%q\nCMD=%q\n%s\n' "$IN_GET" "$PUT" "$ASSETS" "$JOBT" "$CMD" "$BOOT" | $SSH 'bash -s'
+RC=$?; set -e
+echo "remote rc=$RC after $(( $(date +%s) - T0 )) s"
+[ "$RC" -eq 78 ] && infra_fail 78 bootstrap_failed
+
+# 5. fetch result
+python3 - "$RUN_ID" "$OUT/result.tgz" <<'EOF' || infra_fail 76 "result_missing(rc=$RC)"
+import os, sys, boto3
+s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
+                  aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
+s3.download_file(os.environ['B2_BUCKET'], f'runs/{sys.argv[1]}/result.tgz', sys.argv[2])
+EOF
+tar -xzf "$OUT/result.tgz" -C "$OUT" && rm -f "$OUT/result.tgz"
+echo "gpu: $(tr '\n' ' ' < "$OUT/gpu.txt" 2>/dev/null)"; echo "command exit: $(cat "$OUT/exit_code" 2>/dev/null)"
+echo "artifacts: $OUT  (B2 runs/$RUN_ID, expires ~30 d)"

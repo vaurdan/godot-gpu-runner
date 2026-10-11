@@ -1,0 +1,24 @@
+#!/bin/bash
+# gpu-job-infer: run one generic ML inference command on a disposable Vast.ai GPU (any public image) and fetch /job/out,
+# retrying infrastructure failures on a fresh machine (as gpu-job does for Godot).
+# Usage: gpu-job-infer <image> <inputs_dir> <out_dir> -- <remote shell command>
+# Example: INFER_ASSETS="weights=/data/kimodo-weights" gpu-job-infer pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel ./in ./out -- \
+#            'bash /job/in/run.sh'
+# Each attempt is gpu-job-infer-once (see its header for env vars: GPU_QUERY, GPU_MAX_DPH, GPU_DISK, JOB_TIMEOUT, INFER_ASSETS...).
+# Retried on a fresh machine: no offer (69), never running (75), result missing (76), bootstrap failed (78).
+# Not retried: the remote command's own exit code (in out/exit_code; gpu-job-infer still exits 0), bad arguments, local errors.
+# Env: GPU_ATTEMPTS (default 3), GPU_RETRY_SLEEP (seconds before retrying "no offer", default 60).
+ONCE=${GPU_JOB_INFER_ONCE:-/usr/local/bin/gpu-job-infer-once}
+N=${GPU_ATTEMPTS:-3}; EXCL="${GPU_EXCLUDE:-}"
+mkdir -p "$3"; LOG="$3/gpu-job.log"
+for i in $(seq 1 "$N"); do
+  [ "$i" -gt 1 ] && echo "gpu-job-infer: attempt $i/$N (excluding machines:${EXCL:- none})" | tee -a "$LOG" >&2
+  GPU_EXCLUDE="$EXCL" "$ONCE" "$@"; RC=$?
+  case $RC in
+    69) [ "$i" -lt "$N" ] && sleep "${GPU_RETRY_SLEEP:-60}" ;;
+    75|76|78) EXCL="$EXCL $(cat "$3/.failed-machine" 2>/dev/null)"; rm -f "$3/.failed-machine" ;;
+    *) exit $RC ;;
+  esac
+done
+echo "gpu-job-infer: giving up after $N attempts (last rc=$RC)" | tee -a "$LOG" >&2
+exit $RC
