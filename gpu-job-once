@@ -55,7 +55,7 @@ echo "code archive sha256=$CSHA"
 read -r OFFER MID < <($V search offers "$QUERY" -o dph_total --raw | python3 -c "
 import json,sys,os
 skip=set('$SKIP'.split())
-o=[x for x in json.load(sys.stdin) if ('${GPU_MACHINE:-}'=='' or str(x.get('machine_id'))=='${GPU_MACHINE:-}') and str(x.get('machine_id')) not in skip and x['dph_total']<=float('$MAXDPH') and int(str(x.get('driver_version') or '0').split('.')[0])>=int('${GPU_MIN_DRIVER:-535}')]
+o=[x for x in json.load(sys.stdin) if ('${GPU_MACHINE:-}'=='' or str(x.get('machine_id'))=='${GPU_MACHINE:-}') and str(x.get('machine_id')) not in skip and x['dph_total']<=float('$MAXDPH') and int(str(x.get('driver_version') or '0').split('.')[0])>=int('${GPU_MIN_DRIVER:-550}')]
 # RTX 3060 is the graphics baseline; 3060 Ti / 3070 only when no 3060 is available
 o.sort(key=lambda x: (x.get('gpu_name')!='RTX 3060', x['dph_total']))
 print(o[0]['id'], o[0].get('machine_id')) if o else print('')
