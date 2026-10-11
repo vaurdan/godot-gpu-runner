@@ -1,0 +1,15 @@
+#!/bin/bash
+# Read-only peek into a running gpu-job instance: godot progress, memory, recent log lines.
+# Usage: gpu-peek <instance_id>
+IID=$1
+V=/root/.venvs/vast/bin/vastai; KEY=/root/.ssh/vast_ed25519
+read -r IP PORT < <($V show instance "$IID" --raw | python3 -c "
+import json,sys;d=json.load(sys.stdin);p=((d.get('ports') or {}).get('22/tcp') or [{}])[0].get('HostPort');print(d.get('public_ipaddr'),p)")
+ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o LogLevel=ERROR -p "$PORT" root@"$IP" '
+echo "== uptime/mem"; uptime; free -m | head -2
+echo "== godot"; ps -eo pid,etime,rss,pcpu,args | grep -E "[g]odot" | cut -c1-200
+echo "== out"; ls -la /job/out 2>/dev/null
+echo "== run.log tail"; tail -25 /job/out/run.log 2>/dev/null
+echo "== import.log tail"; tail -5 /job/out/import.log 2>/dev/null
+echo "== dmesg oom"; dmesg 2>/dev/null | grep -i -E "oom|killed process" | tail -5
+'

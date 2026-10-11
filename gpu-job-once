@@ -89,8 +89,15 @@ ARGS=$(printf '%q ' "$@")
 set +e; $SSH "rm -f /root/.vast_api_key; JOB_TIMEOUT=$JOBT run-job '$GET' $CSHA '$PUT' -- $ARGS"; RC=$?; set -e
 echo "remote rc=$RC"
 
-# 5. fetch result
-python3 - "$RUN_ID" "$OUT/result.tgz" <<'EOF' || infra_fail 76 "result_missing(rc=$RC)"
+# 5. fetch result (on failure, pull the instance's own logs first: the trap destroys it on exit)
+pull_logs() {
+  mkdir -p "$OUT/remote-logs"
+  $SSH 'cd /job/out 2>/dev/null && tail -c 200000 run.log 2>/dev/null; echo "== exit_code: $(cat exit_code 2>/dev/null)"; echo "== ls"; ls -la /job/out /job 2>&1; echo "== import.log tail"; tail -40 import.log 2>/dev/null; echo "== mem"; free -m; echo "== dmesg"; dmesg 2>/dev/null | grep -iE "oom|killed process|segfault|nvidia|xid" | tail -20; echo "== disk"; df -h /job 2>&1' \
+    > "$OUT/remote-logs/remote-$MID.txt" 2>&1 || echo "(ssh log pull failed)" >> "$OUT/remote-logs/remote-$MID.txt"
+  echo "--- remote logs ($OUT/remote-logs/remote-$MID.txt), tail ---"; tail -30 "$OUT/remote-logs/remote-$MID.txt"
+}
+if [ "$RC" -ne 0 ]; then pull_logs; fi
+python3 - "$RUN_ID" "$OUT/result.tgz" <<'EOF' || { [ "$RC" -eq 0 ] && pull_logs; infra_fail 76 "result_missing(rc=$RC)"; }
 import os, sys, boto3
 s3 = boto3.client('s3', endpoint_url=os.environ['B2_ENDPOINT'], region_name=os.environ['B2_REGION'],
                   aws_access_key_id=os.environ['B2_KEY_ID'], aws_secret_access_key=os.environ['B2_APP_KEY'])
