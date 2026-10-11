@@ -23,7 +23,7 @@ Main env vars (see the `gpu-job-once` header for all): `GPU_QUERY`, `GPU_MAX_DPH
 
 Since 2026-10-11 godot runs by default on a **real Xorg on the NVIDIA driver** (`:1`, virtual 1920x1080 screen, no monitor).
 Before that every job ran on Xvfb (`:99`), where each presented frame is copied back through the CPU: an empty 1080p window
-cost 36-80 ms per frame on Xvfb against 0.26-0.38 ms on Xorg on the same machines.
+cost 5.8-80 ms per frame on Xvfb (36-80 ms on most hosts) against 0.26-0.46 ms on Xorg on the same machines.
 **Frame times measured before 2026-10-11 (Xvfb) are not comparable 1:1 with later runs (Xorg).**
 
 | `RUNNER_DISPLAY` | behaviour |
