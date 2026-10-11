@@ -93,13 +93,20 @@ trap cleanup EXIT
 
 # 3. wait for SSH (image pull included)
 for i in $(seq 1 90); do
-  read -r ST IP PORT < <($V show instance "$IID" --raw | python3 -c "
-import json,sys;d=json.load(sys.stdin);p=((d.get('ports') or {}).get('22/tcp') or [{}])[0].get('HostPort');print(d.get('actual_status'),d.get('public_ipaddr'),p)")
-  [ "$ST" = running ] && [ "$PORT" != None ] && break; sleep 10
+  read -r ST IP PORT ERR < <($V show instance "$IID" --raw | python3 -c "
+import json,sys;d=json.load(sys.stdin);p=((d.get('ports') or {}).get('22/tcp') or [{}])[0].get('HostPort');m=(d.get('status_msg') or '')
+bad=any(k in m for k in ('Error response from daemon','failed to create','OCI runtime','unresolvable CDI'))
+print(d.get('actual_status'),d.get('public_ipaddr'),p,'ERR' if bad else 'ok')")
+  [ "$ST" = running ] && [ "$PORT" != None ] && break
+  # fail fast: a host whose docker cannot even create the container never recovers (seen: CDI GPU injection errors, 12+ min stuck)
+  [ "$ERR" = ERR ] && { $V show instance "$IID" --raw | python3 -c "import json,sys;print('host error:',json.load(sys.stdin).get('status_msg','')[:300])"; infra_fail 75 container_create_error; }
+  sleep 10
 done
 [ "$ST" = running ] || infra_fail 75 never_running
 SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15 -o ServerAliveInterval=30 -o LogLevel=ERROR -p $PORT root@$IP"
-for i in $(seq 1 12); do $SSH true 2>/dev/null && break; sleep 5; done
+# the key can reach the instance a while after sshd is up (seen: 'Permission denied (publickey)' for >60 s after "running")
+SSH_OK=0; for i in $(seq 1 36); do $SSH true 2>/dev/null && { SSH_OK=1; break; }; sleep 5; done
+[ "$SSH_OK" = 1 ] || infra_fail 75 ssh_never_ready
 echo "ssh up after $(( $(date +%s) - T0 )) s"
 
 # 4. bootstrap (python stdlib only: no curl needed in the image), run, upload. Exit 78 = bootstrap failed (infra).
