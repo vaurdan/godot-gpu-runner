@@ -8,7 +8,8 @@
 #   INFER_ASSETS="name=/local/dir name2=/local/dir2": big read-only dirs (model weights), packed once and cached in B2 by
 #   sha256 (assets/<sha>.tar), unpacked at /job/assets/<name>. Credentials never leave this host: the instance only gets
 #   presigned GET/PUT URLs; /root/.vast_api_key is deleted on the instance before anything runs.
-# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 0.25), GPU_DISK (GB, default 40), GPU_TTL (safety net s, default 3600),
+# Default offer filter = verified datacenter hosts only (Henrique 2026-10-12: pay a bit more, save time).
+# Env: GPU_QUERY (offer filter), GPU_MAX_DPH (default 1.00), GPU_DISK (GB, default 40), GPU_TTL (safety net s, default 3600),
 #      JOB_TIMEOUT (remote command limit s, default 1800, max 6600 = vast-reaper 120 min minus setup), GPU_MIN_DRIVER (550),
 #      GPU_MACHINE / GPU_EXCLUDE (as gpu-job-once). Machine blacklist shared with gpu-job: /var/lib/gpu-job/bad-machines.log.
 # The instance label is gpu-job-<RUN_ID> with RUN_ID ending in this script's pid and the script name contains "gpu-job":
@@ -19,8 +20,8 @@ CMD="$*"; [ -n "$CMD" ] || { echo "need a remote command after --" >&2; exit 64;
 [ -d "$IN" ] || { echo "inputs_dir $IN is not a directory" >&2; exit 64; }
 V=/root/.venvs/vast/bin/vastai; KEY=/root/.ssh/vast_ed25519
 set -a; . /root/.config/b2/godot-gpu-queue.env; set +a
-QUERY=${GPU_QUERY:-"num_gpus=1 gpu_ram>=20 reliability>0.98 rentable=true inet_down>500 disk_space>=${GPU_DISK:-40} cuda_vers>=12.4"}
-MAXDPH=${GPU_MAX_DPH:-0.25}; JOBT=${JOB_TIMEOUT:-1800}; TTL=${GPU_TTL:-3600}
+QUERY=${GPU_QUERY:-"num_gpus=1 gpu_ram>=20 reliability>0.98 rentable=true inet_down>500 disk_space>=${GPU_DISK:-40} cuda_vers>=12.4 verified=true datacenter=true"}
+MAXDPH=${GPU_MAX_DPH:-1.00}; JOBT=${JOB_TIMEOUT:-1800}; TTL=${GPU_TTL:-3600}
 [ "$JOBT" -gt 6600 ] && { echo "JOB_TIMEOUT $JOBT capped to 6600 s (vast-reaper limit 120 min)" >&2; JOBT=6600; }
 [ "$TTL" -lt $((JOBT + 1200)) ] && TTL=$((JOBT + 1200))
 export URL_TTL=$((TTL + 600))
